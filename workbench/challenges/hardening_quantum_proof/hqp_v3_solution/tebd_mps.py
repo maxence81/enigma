@@ -5,6 +5,7 @@ SVD truncation, swap network for all-to-all CZ, canonical beam-search argmax) to
 torch so it runs on the validator GPU via the CUDA libs torch already bundles —
 no cupy/libcublas dependency. Algorithm validated against exact statevector.
 """
+import os
 import time
 import torch
 
@@ -62,7 +63,14 @@ class MPS:
         theta = torch.tensordot(A1, A2, dims=([2], [0]))           # (Dl,2,2,Dr)
         theta = torch.einsum("IJij,aijc->aIJc", G4, theta)
         M = theta.reshape(Dl * 2, 2 * Dr)
-        U, s, Vh = torch.linalg.svd(M, full_matrices=False)
+        if M.is_cuda:
+            driver = os.environ.get("HQP_SVD_DRIVER", "gesvd")
+            try:
+                U, s, Vh = torch.linalg.svd(M, full_matrices=False, driver=driver)
+            except Exception:
+                U, s, Vh = torch.linalg.svd(M, full_matrices=False)
+        else:
+            U, s, Vh = torch.linalg.svd(M, full_matrices=False)
         k = min(chi, M.shape[0], M.shape[1])
         U = U[:, :k]; s = s[:k]; Vh = Vh[:k, :]
         s = s / torch.linalg.vector_norm(s)
