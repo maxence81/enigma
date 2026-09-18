@@ -16,8 +16,10 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-# Install bittensor v11 compatibility shims before any other local imports.
-from qbittensor import bt_compat as _bt_compat  # noqa: F401
+try:
+    from qbittensor import bt_compat as _bt_compat  # noqa: F401
+except ImportError:
+    _bt_compat = None
 
 # Define the version of the template module.
 __version__ = "2.1.1"

@@ -23,7 +23,13 @@ import subprocess
 import time
 import zipfile
 
-import bittensor as bt
+try:
+    import bittensor as bt
+except ImportError:
+    import logging as _logging
+    class _BtDummy:
+        logging = _logging.getLogger("qbittensor")
+    bt = _BtDummy()
 
 from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
 from qbittensor.utils.solution_status import OutputExtractionStatus, ValidationFailureReason

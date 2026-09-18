@@ -782,8 +782,18 @@ def install() -> None:
 
     # Convenience: Wallet/Subtensor add_args used by config()
     Wallet.add_args = staticmethod(wallet_add_args)  # type: ignore[attr-defined]
-    bt.Subtensor.add_args = staticmethod(subtensor_add_args)  # type: ignore[attr-defined]
-    bt.Axon.add_args = classmethod(lambda cls, parser: axon_add_args(parser))  # type: ignore[attr-defined]
+    if hasattr(bt, "Subtensor"):
+        bt.Subtensor.add_args = staticmethod(subtensor_add_args)  # type: ignore[attr-defined]
+    else:
+        class DummySubtensor:
+            add_args = staticmethod(subtensor_add_args)
+        bt.Subtensor = DummySubtensor  # type: ignore[attr-defined]
+    if hasattr(bt, "Axon"):
+        bt.Axon.add_args = classmethod(lambda cls, parser: axon_add_args(parser))  # type: ignore[attr-defined]
+    else:
+        class DummyAxon:
+            add_args = classmethod(lambda cls, parser: axon_add_args(parser))
+        bt.Axon = DummyAxon  # type: ignore[attr-defined]
 
     _INSTALLED = True
 
