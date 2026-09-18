@@ -405,6 +405,7 @@ def _solve_tebd_v4(qc):
             log(f"Primary candidate overlap P(|00...0>) = {p_zero_pri:.6e} | Syndrome: {syndrome}")
 
             evaluated = {primary_cand: p_zero_pri}
+            active_error_qubits = [i for i, ch in enumerate(syndrome) if ch == "1"]
 
             if p_zero_pri >= 0.01:
                 log(f"  [EARLY-STOP] Primary candidate {primary_cand} ALREADY certified with decisive physical overlap P={p_zero_pri:.6e} >= 0.01! Skipping pool search.")
@@ -441,7 +442,6 @@ def _solve_tebd_v4(qc):
                             cand_pool.append(cb_str)
 
                 # Check if syndrome has active error bits
-                active_error_qubits = [i for i, ch in enumerate(syndrome) if ch == "1"]
                 if 0 < len(active_error_qubits) <= 16:
                     log(f"Detected {len(active_error_qubits)} active error qubits in syndrome: {active_error_qubits}")
                     corrected = list(primary_cand)
@@ -483,9 +483,9 @@ def _solve_tebd_v4(qc):
                         suspect_qubits.append(q)
             suspect_qubits = suspect_qubits[:24]
 
-            # Coordinate ascent under U^dagger only if overlap is in the ambiguous zone (1e-10 < prob < 0.05)
-            # If best_res_prob is already >= 0.05, the exact peak is certified and no bitflips are needed.
-            if suspect_qubits and (1e-10 < best_res_prob < 0.05) and (time_left() - SAFETY > 300):
+            # Coordinate ascent under U^dagger only if overlap is in the ambiguous zone (1e-10 < prob < 0.01)
+            # If best_res_prob is already >= 0.01, the exact peak is certified and no bitflips are needed.
+            if suspect_qubits and (1e-10 < best_res_prob < 0.01) and (time_left() - SAFETY > 300):
                 log(f"Running coordinate ascent under U^dagger on {len(suspect_qubits)} suspect qubits: {suspect_qubits}")
                 cur_cand = best_res_cand
                 cur_prob = best_res_prob
