@@ -68,7 +68,7 @@ setup(
     include_package_data=True,
     author_email="qbittensorlabs@gmail.com",
     license="MIT",
-    python_requires=">=3.12",
+    python_requires=">=3.10",
     install_requires=requirements,
     entry_points={
         "console_scripts": [
