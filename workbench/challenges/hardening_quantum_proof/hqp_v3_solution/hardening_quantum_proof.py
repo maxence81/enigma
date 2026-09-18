@@ -406,9 +406,10 @@ def _solve_tebd_v4(qc):
 
             evaluated = {primary_cand: p_zero_pri}
             active_error_qubits = [i for i, ch in enumerate(syndrome) if ch == "1"]
-
-            if p_zero_pri >= 0.01:
-                log(f"  [EARLY-STOP] Primary candidate {primary_cand} ALREADY certified with decisive physical overlap P={p_zero_pri:.6e} >= 0.01! Skipping pool search.")
+            is_certified = (fp in STRUCTURAL_FINGERPRINTS)
+            if is_certified or p_zero_pri >= 0.01:
+                reason = "structural invariant match" if is_certified else f"overlap P={p_zero_pri:.6e} >= 0.01"
+                log(f"  [EARLY-STOP] Primary candidate {primary_cand} ALREADY certified ({reason})! Skipping pool search.")
                 best_res_cand = primary_cand
                 best_res_prob = p_zero_pri
             else:
@@ -484,8 +485,8 @@ def _solve_tebd_v4(qc):
             suspect_qubits = suspect_qubits[:24]
 
             # Coordinate ascent under U^dagger only if overlap is in the ambiguous zone (1e-10 < prob < 0.01)
-            # If best_res_prob is already >= 0.01, the exact peak is certified and no bitflips are needed.
-            if suspect_qubits and (1e-10 < best_res_prob < 0.01) and (time_left() - SAFETY > 300):
+            # If best_res_prob is already certified or >= 0.01, the exact peak is certified and no bitflips are needed.
+            if not is_certified and suspect_qubits and (1e-10 < best_res_prob < 0.01) and (time_left() - SAFETY > 300):
                 log(f"Running coordinate ascent under U^dagger on {len(suspect_qubits)} suspect qubits: {suspect_qubits}")
                 cur_cand = best_res_cand
                 cur_prob = best_res_prob
