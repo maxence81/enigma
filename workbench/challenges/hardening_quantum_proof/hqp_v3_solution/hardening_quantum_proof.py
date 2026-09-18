@@ -351,7 +351,7 @@ def _solve_tebd_v4(qc):
         t_inv_total = time.time()
         try:
             qc_inv = qc.inverse()
-            perm_inv = compute_degree_centered_order(qc_inv)
+            perm_inv = compute_spectral_order(qc_inv)
             compiled_inv = precompile_circuit(qc_inv, dtype, dev)
             chi_inv = int(os.environ.get("HQP_CHI_INV", "48"))
             SWAP_inv = torch.tensor(
@@ -398,35 +398,6 @@ def _solve_tebd_v4(qc):
                 if target_state not in cand_pool:
                     cand_pool.insert(0, target_state)
 
-            # Include diverse representatives across beam pool
-            pool_candidates = [c[0] if isinstance(c, (list, tuple)) else c for c in cands[:128]]
-            for item in cands[:64]:
-                c = item[0] if isinstance(item, (list, tuple)) else item
-                if c and c not in cand_pool:
-                    cand_pool.append(c)
-
-            # Subspace Combinations on the most uncertain qubits across the beam pool
-            qubit_entropy = []
-            for q in range(n):
-                c0 = sum(1 for cand in pool_candidates if cand[q] == "0")
-                c1 = len(pool_candidates) - c0
-                if min(c0, c1) > 0:
-                    qubit_entropy.append((q, min(c0, c1)))
-            qubit_entropy.sort(key=lambda x: x[1], reverse=True)
-            top_uncertain = [q[0] for q in qubit_entropy[:5]]
-            log(f"Top uncertain qubits for subspace resonance: {top_uncertain}")
-
-            # Expand subspace combinations on top distinct candidate clusters
-            base_cands = list(cand_pool[:8])
-            for base in base_cands:
-                for m in range(1 << len(top_uncertain)):
-                    cb = list(base)
-                    for b_idx, q in enumerate(top_uncertain):
-                        cb[q] = str((m >> b_idx) & 1)
-                    cb_str = "".join(cb)
-                    if cb_str not in cand_pool:
-                        cand_pool.append(cb_str)
-
             # Evaluate primary candidate and extract syndrome
             primary_cand = cand_pool[0]
             log(f"Evaluating primary candidate under U^dagger (chi={chi_inv})...")
@@ -435,34 +406,68 @@ def _solve_tebd_v4(qc):
 
             evaluated = {primary_cand: p_zero_pri}
 
-            # Check if syndrome has active error bits
-            active_error_qubits = [i for i, ch in enumerate(syndrome) if ch == "1"]
-            if 0 < len(active_error_qubits) <= 16:
-                log(f"Detected {len(active_error_qubits)} active error qubits in syndrome: {active_error_qubits}")
-                corrected = list(primary_cand)
-                for q in active_error_qubits:
-                    corrected[q] = "0" if corrected[q] == "1" else "1"
-                corrected_str = "".join(corrected)
-                if corrected_str not in cand_pool:
-                    cand_pool.insert(1, corrected_str)
-                    log(f"Syndrome correction produced candidate: {corrected_str}")
+            if p_zero_pri >= 0.01:
+                log(f"  [EARLY-STOP] Primary candidate {primary_cand} ALREADY certified with decisive physical overlap P={p_zero_pri:.6e} >= 0.01! Skipping pool search.")
+                best_res_cand = primary_cand
+                best_res_prob = p_zero_pri
+            else:
+                # Include diverse representatives across beam pool
+                pool_candidates = [c[0] if isinstance(c, (list, tuple)) else c for c in cands[:128]]
+                for item in cands[:64]:
+                    c = item[0] if isinstance(item, (list, tuple)) else item
+                    if c and c not in cand_pool:
+                        cand_pool.append(c)
 
-            # Test up to max_inv_evals unique candidates from the pool
-            max_inv_evals = int(os.environ.get("HQP_MAX_INV_EVALS", "64"))
-            log(f"Evaluating top {min(len(cand_pool), max_inv_evals)} candidates from pool under U^dagger (chi={chi_inv})...")
-            for c in cand_pool[:max_inv_evals]:
-                if c not in evaluated and (time_left() - SAFETY > 120):
-                    p_z, _ = run_u_dagger(c)
-                    evaluated[c] = p_z
-                    log(f"  Candidate {c}: Overlap P(|00...0>) = {p_z:.6e}")
-                    if p_z >= 0.01:
-                        log(f"  [EARLY-STOP] Decisive physical peak certified (Overlap P={p_z:.6e} >= 0.01) -> terminating pool search early!")
-                        break
+                # Subspace Combinations on the most uncertain qubits across the beam pool
+                qubit_entropy = []
+                for q in range(n):
+                    c0 = sum(1 for cand in pool_candidates if cand[q] == "0")
+                    c1 = len(pool_candidates) - c0
+                    if min(c0, c1) > 0:
+                        qubit_entropy.append((q, min(c0, c1)))
+                qubit_entropy.sort(key=lambda x: x[1], reverse=True)
+                top_uncertain = [q[0] for q in qubit_entropy[:5]]
+                log(f"Top uncertain qubits for subspace resonance: {top_uncertain}")
 
-            # Pick candidate with maximum overlap P(|00...0>) from pool
-            best_res_cand = max(evaluated.keys(), key=lambda k: evaluated[k])
-            best_res_prob = evaluated[best_res_cand]
-            log(f"Pool evaluation winner: {best_res_cand} (Overlap={best_res_prob:.6e})")
+                # Expand subspace combinations on top distinct candidate clusters
+                base_cands = list(cand_pool[:8])
+                for base in base_cands:
+                    for m in range(1 << len(top_uncertain)):
+                        cb = list(base)
+                        for b_idx, q in enumerate(top_uncertain):
+                            cb[q] = str((m >> b_idx) & 1)
+                        cb_str = "".join(cb)
+                        if cb_str not in cand_pool:
+                            cand_pool.append(cb_str)
+
+                # Check if syndrome has active error bits
+                active_error_qubits = [i for i, ch in enumerate(syndrome) if ch == "1"]
+                if 0 < len(active_error_qubits) <= 16:
+                    log(f"Detected {len(active_error_qubits)} active error qubits in syndrome: {active_error_qubits}")
+                    corrected = list(primary_cand)
+                    for q in active_error_qubits:
+                        corrected[q] = "0" if corrected[q] == "1" else "1"
+                    corrected_str = "".join(corrected)
+                    if corrected_str not in cand_pool:
+                        cand_pool.insert(1, corrected_str)
+                        log(f"Syndrome correction produced candidate: {corrected_str}")
+
+                # Test up to max_inv_evals unique candidates from the pool
+                max_inv_evals = int(os.environ.get("HQP_MAX_INV_EVALS", "64"))
+                log(f"Evaluating top {min(len(cand_pool), max_inv_evals)} candidates from pool under U^dagger (chi={chi_inv})...")
+                for c in cand_pool[:max_inv_evals]:
+                    if c not in evaluated and (time_left() - SAFETY > 120):
+                        p_z, _ = run_u_dagger(c)
+                        evaluated[c] = p_z
+                        log(f"  Candidate {c}: Overlap P(|00...0>) = {p_z:.6e}")
+                        if p_z >= 0.01:
+                            log(f"  [EARLY-STOP] Decisive physical peak certified (Overlap P={p_z:.6e} >= 0.01) -> terminating pool search early!")
+                            break
+
+                # Pick candidate with maximum overlap P(|00...0>) from pool
+                best_res_cand = max(evaluated.keys(), key=lambda k: evaluated[k])
+                best_res_prob = evaluated[best_res_cand]
+                log(f"Pool evaluation winner: {best_res_cand} (Overlap={best_res_prob:.6e})")
 
             # Coordinate ascent under U^dagger on fluctuating / suspect qubits
             suspect_qubits = []
