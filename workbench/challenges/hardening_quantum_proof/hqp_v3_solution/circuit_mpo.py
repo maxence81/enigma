@@ -85,18 +85,15 @@ def apply_mpo(mpo1: MatrixProductOperator, mpo2: MatrixProductOperator,
     # permute-arrays mismatch that the lazy (2-tensor/site) structure triggers.
     #
     # Truncation mode (HQP_CUTOFF_MODE):
-    #   "rel" (default, upstream): quimb's relative cutoff (cutoff_mode=1) —
+    #   "rel": quimb's relative cutoff —
     #       discards singular values below cutoff * s_max. Scale-free, but on a
     #       peaked circuit the peak-carrying sectors can sit far below s_max:
     #       they get trimmed first, which is what dissolved the d3 peak in the
     #       2026-09-07/08 runs (w1 ~ 2e-10, MPO core bond 34 at end).
-    #   "abs": absolute cutoff (quimb cutoff_mode=4) — discards values below
+    #   "abs" (v9 default): absolute cutoff — discards values below
     #       the raw threshold, protecting every sector with amplitude above the
-    #       floor regardless of scale. Verified on quimb 1.11: mode 4 keeps
-    #       40-58 sectors where mode 1 keeps all-or-nothing on flat spectra.
-    # "abs" is experimental: larger bonds -> slower absorption; pair it with a
-    # small cutoff (e.g. 1e-3) and a high max_bond (4096).
-    cutoff_mode = os.environ.get("HQP_CUTOFF_MODE", "rel")
+    #       floor regardless of the current largest singular value.
+    cutoff_mode = os.environ.get("HQP_CUTOFF_MODE", "abs")
     if cutoff_mode in ("abs", "rel", "sum2", "rsum2"):
         cutoff_opts = {"cutoff_mode": cutoff_mode, "cutoff": cutoff}
     else:
