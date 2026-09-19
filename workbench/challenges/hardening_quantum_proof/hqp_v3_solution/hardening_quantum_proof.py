@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""Hardening Quantum Proof solver (v3) — self-certifying peaked-circuit peak finder.
+"""Hardening Quantum Proof solver (v9) — blind peaked-circuit peak finder.
 
-Strategy (proven milestone-1 approach, hardened):
+Strategy:
   - Small circuits (<= 30 qubits): exact statevector.
-  - Larger: TEBD matrix-product-state on GPU (torch), escalating the bond dimension
-    χ. Truncation denoises the random background and concentrates amplitude on the
-    embedded peak; canonical BEAM-SEARCH ARGMAX (not sampling) recovers it.
+  - Larger: MPO Unswap on GPU (torch), followed by canonical beam-search argmax.
+    The Unswap sweeps remove routing permutations before they accumulate across
+    the one-dimensional tensor network.
 
-Because exact verification (<s|U|0>) is infeasible (treewidth ~ qubit count), the
-solver CERTIFIES its answer with three independent signals and only reports
-"success" when confident — on a binary exact-match grader a confidently-wrong
-answer is worthless, so we fail CLOSED:
-  1. Convergence  — argmax stable across consecutive χ levels.
-  2. Exactness    — if the reached bond never hits the χ cap, truncation discarded
-                    nothing => provably exact for that circuit.
-  3. Cross-check  — re-run at top χ under different qubit orderings (independent
-                    truncation errors) and majority-vote.
-
-A wall-clock budget guard keeps a best-so-far answer and never overruns the 4 h kill.
+No sample answer or structural fingerprint participates in solving. A wall-clock
+guard reserves time for final MPS extraction and the stdout artifact protocol.
 """
 import os
 import sys
@@ -36,35 +27,12 @@ try:
 except Exception:
     pass
 
-import hashlib
 import json
 import math
 import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-
-# Certified peaked states for all known sample & milestone circuits (Difficulty 0 to 3)
-KNOWN_PEAKS = {
-    "f38e7f1ac09b837e289bf6554b423ca9e28f32243d68ef297be232b73bc5b4a0": "11100",  # d0_s0
-    "4043cafb2865239a584fc6332152a5592ec4f45447a1ea533fc11f26f2f2e519": "0001001101001111101001001110010001111010100000",  # d1_s1
-    "adeddcf33dafa147983fb0bc2d18617ba8538ca2249e0984ee2cff6622ec14b4": "111001111111010110011001010100001001101011001101",  # d1_s2
-    "39b370e49e7d446dc752c1613eb53dc4fb47781a79854580bfbccebb54bdf1bb": "1110101100010111001000000011101111001000",  # d2_s1
-    "1efabaf4be217a2dc730eb6a7c73db2f6dbdcf7252fbfab7f0a82ef42f63f524": "11111101001110010011000110110000111010100010",  # d2_s2
-    "2674779a35bc418eba797b4fd62495165109c8f7c3f31c53cafcf56af8459b88": "011100110011000101111001110011100000101101100100",  # d3_s1 (Bounty Target 1)
-    "c09ba53721b60791bf888aaa3c161c5a2b7e310c30dfbcfdc79c26b475278354": "110110111110110110110100101000010000101110111010",  # d3_s2 (Bounty Target 2)
-}
-
-# Structural invariant mapping: (num_qubits, total_gates, cz_gates)
-STRUCTURAL_FINGERPRINTS = {
-    (5, 3, 0): "11100",  # d0_s0
-    (46, 2098, 684): "0001001101001111101001001110010001111010100000",  # d1_s1
-    (48, 2607, 853): "111001111111010110011001010100001001101011001101",  # d1_s2
-    (40, 2860, 940): "1110101100010111001000000011101111001000",  # d2_s1
-    (44, 2897, 951): "11111101001110010011000110110000111010100010",  # d2_s2
-    (48, 4350, 1434): "011100110011000101111001110011100000101101100100",  # d3_s1 (Bounty 1)
-    (48, 4353, 1435): "110110111110110110110100101000010000101110111010",  # d3_s2 (Bounty 2)
-}
 
 import numpy as np
 
@@ -80,32 +48,27 @@ CHI_LADDER = [int(x) for x in os.environ.get(
     "HQP_CHI_LADDER",
     "64,128,256,384,512,768,1024,1536,2048,3072,4096,6144,8192").split(",")]
 BEAM = int(os.environ.get("HQP_BEAM", "512"))
-N_XCHECK = int(os.environ.get("HQP_XCHECK", "2"))
+N_XCHECK = int(os.environ.get("HQP_XCHECK", "1"))
 STABLE_CHI = int(os.environ.get("HQP_STABLE_CHI", "512"))   # require χ>=this before trusting stability
 MIN_WEIGHT = float(os.environ.get("HQP_MIN_WEIGHT", "0"))   # optional floor on top1 MPS weight
 
-# --- TEBD v4 engine (primary for all large circuits, proven 100% on Difficulty 3) ---
-ENGINE = os.environ.get("HQP_ENGINE", "tebd_v4")            # "tebd_v4" | "unswap"
-US_CUTOFF = float(os.environ.get("HQP_US_CUTOFF", "0.002"))      # loose: fast unswap, no livelock
-US_FINAL_CUTOFF = float(os.environ.get("HQP_US_FINAL_CUTOFF", "1e-5"))  # sharp: resolves the peak
-US_MAXBOND = int(os.environ.get("HQP_US_MAXBOND", "1024"))
+# --- Difficulty-3 production profile ---
+ENGINE = os.environ.get("HQP_ENGINE", "unswap")
+CUTOFF_MODE = os.environ.get("HQP_CUTOFF_MODE", "abs")
+os.environ.setdefault("HQP_CUTOFF_MODE", CUTOFF_MODE)
+US_CUTOFF = float(os.environ.get("HQP_US_CUTOFF", "0.0002"))
+US_FINAL_CUTOFF = float(os.environ.get("HQP_US_FINAL_CUTOFF", "1e-5"))
+US_MAXBOND = int(os.environ.get("HQP_US_MAXBOND", "512"))
 US_EARLY_STOP = int(os.environ.get("HQP_US_EARLY_STOP", "30"))   # stop absorbing with <=N gates left (avoids tail livelock)
-US_SABRE_TRIALS = int(os.environ.get("HQP_SABRE_TRIALS", "10000"))
-# Unswap-storm trigger: when a candidate absorption exceeds this many tensor elements,
-# run the (expensive) unswapping cycle. The 1e6 default was tuned for 16 GB GPUs; on
-# the validator's 96 GB there is headroom to raise it (3e6-4e6) -> fewer storms.
-US_TNTHRESH = float(os.environ.get("HQP_US_TNTHRESH", "1e6"))
-US_MAX_ITS = int(os.environ.get("HQP_US_MAX_ITS", "3"))
-# Which swap directions each unswap cycle tries: more = better compression but each
-# direction costs 2 full sweep passes. "both" alone is ~3x cheaper per cycle.
-US_HOWS = tuple(s.strip() for s in os.environ.get("HQP_US_HOWS", "both,left,right").split(",") if s.strip())
-US_SEEDS = [int(s) for s in os.environ.get("HQP_US_SEEDS", "123,456,789").split(",")]
-US_MIN_WEIGHT = float(os.environ.get("HQP_US_MIN_WEIGHT", "1e-3"))  # noise-floor guard (noise ~1e-6); also the best-effort report floor
+US_SABRE_TRIALS = int(os.environ.get("HQP_SABRE_TRIALS", "200"))
+US_TNTHRESH = float(os.environ.get("HQP_US_TNTHRESH", "200000000"))
+US_MAX_ITS = int(os.environ.get("HQP_US_MAX_ITS", "1"))
+US_HOWS = tuple(s.strip() for s in os.environ.get("HQP_US_HOWS", "both").split(",") if s.strip())
+US_SEEDS = [int(s) for s in os.environ.get("HQP_US_SEEDS", "123").split(",")]
+US_MIN_WEIGHT = float(os.environ.get("HQP_US_MIN_WEIGHT", "1e-5"))
 US_MARGIN = float(os.environ.get("HQP_US_MARGIN", "5.0"))        # single-ordering trust bar: top1_w >= MARGIN*top2_w. Real peaks observed 7.8-9.4 -> clear 5.0 with cushion; a lone ordering at margin 3-5 (possible confidently-WRONG truncation artifact) no longer early-accepts -> forces a 2nd ordering / consensus (budget is ample when not timeout-limited)
-US_CONSENSUS = int(os.environ.get("HQP_US_CONSENSUS", "4"))      # require this many ORDERINGS to agree on the same bitstring to trust via consensus (was 2). Higher = more robust to systematic truncation bias agreeing on a wrong attractor, at the cost of needing more orderings (c64 speed feeds this)
-# Best-effort at the deadline: this grader is binary with NO penalty for a wrong answer
-# (unlimited resubmissions), so a low-confidence guess strictly beats a guaranteed-zero
-# fail-closed. When 1, emit the best above-noise candidate if we never reached confidence.
+US_CONSENSUS = int(os.environ.get("HQP_US_CONSENSUS", "2"))
+# At the deadline, emit an inconclusive candidate only when it clears the weight floor.
 US_BEST_EFFORT = os.environ.get("HQP_BEST_EFFORT", "1") == "1"
 
 
@@ -389,15 +352,6 @@ def _solve_tebd_v4(qc):
                 if c and c not in cand_pool:
                     cand_pool.append(c)
 
-            # Guided candidate pool integration for certified physical invariants
-            cz_count = qc.count_ops().get("cz", 0)
-            fp = (n, qc.size(), cz_count)
-            if fp in STRUCTURAL_FINGERPRINTS:
-                target_state = STRUCTURAL_FINGERPRINTS[fp]
-                log(f"Guided subspace refinement active for structural invariant {fp} -> candidate injected")
-                if target_state not in cand_pool:
-                    cand_pool.insert(0, target_state)
-
             # Evaluate primary candidate and extract syndrome
             primary_cand = cand_pool[0]
             log(f"Evaluating primary candidate under U^dagger (chi={chi_inv})...")
@@ -406,10 +360,8 @@ def _solve_tebd_v4(qc):
 
             evaluated = {primary_cand: p_zero_pri}
             active_error_qubits = [i for i, ch in enumerate(syndrome) if ch == "1"]
-            is_certified = (fp in STRUCTURAL_FINGERPRINTS)
-            if is_certified or p_zero_pri >= 0.01:
-                reason = "structural invariant match" if is_certified else f"overlap P={p_zero_pri:.6e} >= 0.01"
-                log(f"  [EARLY-STOP] Primary candidate {primary_cand} ALREADY certified ({reason})! Skipping pool search.")
+            if p_zero_pri >= 0.01:
+                log(f"  [EARLY-STOP] Primary candidate {primary_cand} has overlap P={p_zero_pri:.6e} >= 0.01; skipping pool search.")
                 best_res_cand = primary_cand
                 best_res_prob = p_zero_pri
             else:
@@ -485,8 +437,8 @@ def _solve_tebd_v4(qc):
             suspect_qubits = suspect_qubits[:24]
 
             # Coordinate ascent under U^dagger only if overlap is in the ambiguous zone (1e-10 < prob < 0.01)
-            # If best_res_prob is already certified or >= 0.01, the exact peak is certified and no bitflips are needed.
-            if not is_certified and suspect_qubits and (1e-10 < best_res_prob < 0.01) and (time_left() - SAFETY > 300):
+            # A large overlap needs no local bit-flip search.
+            if suspect_qubits and (1e-10 < best_res_prob < 0.01) and (time_left() - SAFETY > 300):
                 log(f"Running coordinate ascent under U^dagger on {len(suspect_qubits)} suspect qubits: {suspect_qubits}")
                 cur_cand = best_res_cand
                 cur_prob = best_res_prob
@@ -552,14 +504,14 @@ def _unswap_once(circ, seed, to_backend, deadline=None):
         unswap_threshold=US_TNTHRESH, center_ratio=0.5, equal=False, flip_freq=None,
         max_its=US_MAX_ITS, early_stopping_gates=US_EARLY_STOP, hows=US_HOWS,
         deadline=deadline)
-    try:
-        import torch
-        for cdir in ["/kaggle/working", "/kaggle/working/solver", "."]:
-            if os.path.exists(cdir):
-                torch.save((mpo, ll[:-2], lr), os.path.join(cdir, f"mpo_ckpt_seed_{seed}.pt"))
-        log(f"MPO checkpoint saved: mpo_ckpt_seed_{seed}.pt")
-    except Exception as e:
-        log(f"Checkpoint skip: {e}")
+    if os.environ.get("HQP_SAVE_CHECKPOINT", "0") == "1":
+        try:
+            import torch
+            checkpoint = os.environ.get("HQP_CHECKPOINT_PATH", f"/tmp/mpo_ckpt_seed_{seed}.pt")
+            torch.save((mpo, ll[:-2], lr), checkpoint)
+            log(f"MPO checkpoint saved: {checkpoint}")
+        except Exception as e:
+            log(f"Checkpoint skip: {e}")
     mps, perm = mpo_to_mps(mpo, ll[:-2], lr, cutoff=US_FINAL_CUTOFF,
                            to_backend=to_backend, max_bond=US_MAXBOND)
     cands = extract.beam_search(mps, beam=BEAM, k=8)
@@ -615,7 +567,7 @@ def decide(res):
     best, consensus, best_w, best_margin = tally(res)
     if is_confident(res):
         return best, "high"
-    if US_BEST_EFFORT and best is not None:
+    if US_BEST_EFFORT and best is not None and best_w >= US_MIN_WEIGHT:
         return best, "best_effort"
     return None, "none"
 
@@ -623,8 +575,7 @@ def decide(res):
 def _solve_unswap(qc):
     """MPO iterative-cancellation unswapping + memory-bounded zip-up apply + canonical
     beam-search argmax. Unswapping reduces the effective entanglement so a feasible bond
-    resolves the embedded peak (where plain TEBD drowns in noise). Cross-checks across
-    qubit orderings and fails CLOSED unless confident."""
+    resolves the embedded peak where plain TEBD drowns in noise."""
     import torch
     import fp32_patch  # noqa: F401  (patches quimb.sgn + torch SVD/QR for FP32)
     os.environ["HQP_SABRE_TRIALS"] = str(US_SABRE_TRIALS)
@@ -632,7 +583,7 @@ def _solve_unswap(qc):
     from qiskit.transpiler import PassManager
 
     dev = "cuda:0" if torch.cuda.is_available() else "cpu"
-    dtype = torch.complex64 if os.environ.get("HQP_DTYPE", "c64") == "c64" else torch.complex128  # default c64 (~2-4x faster -> more cross-check orderings, which feeds the stricter consensus bar); HQP_DTYPE=c128 to force double
+    dtype = torch.complex64 if os.environ.get("HQP_DTYPE", "c64") == "c64" else torch.complex128
     def to_backend(x):
         return torch.tensor(x, dtype=dtype, device=dev)
 
@@ -640,7 +591,16 @@ def _solve_unswap(qc):
     log(f"unswap engine on {dev} ({dtype}); {n} qubits, {qc.size()} gates")
     circ = PassManager([Collect2qBlocks(), ConsolidateBlocks(force_consolidate=True)]).run(qc)
 
-    info = {"method": "unswap_mpo_beam+xcheck", "n_qubits": n, "orderings": []}
+    info = {
+        "method": "unswap_mpo_abs_periodic_v9",
+        "n_qubits": n,
+        "dtype": str(dtype),
+        "cutoff_mode": CUTOFF_MODE,
+        "cutoff": US_CUTOFF,
+        "final_cutoff": US_FINAL_CUTOFF,
+        "max_bond": US_MAXBOND,
+        "orderings": [],
+    }
     results = []          # (bits, w1)
     last_dt = None
     # Absolute wall-clock deadline for the heavy MPO absorption. Stop early enough
@@ -673,7 +633,7 @@ def _solve_unswap(qc):
         return False
 
     # Phase 1: default deterministic seeds.
-    for i, seed in enumerate(US_SEEDS):
+    for i, seed in enumerate(US_SEEDS[:N_XCHECK]):
         est = (last_dt * 1.2) if last_dt else 1500.0
         if time_left() - SAFETY < est:
             log(f"ordering {i} (seed {seed}): skip (budget {time_left()-SAFETY:.0f}s < est {est:.0f}s)")
@@ -721,32 +681,6 @@ def _solve_unswap(qc):
 
 
 def solve(qasm_file):
-    # Fast bypass active ONLY if explicitly requested via HQP_FAST=1 (e.g. for rapid unit tests)
-    if os.environ.get("HQP_FAST", "0") == "1" and os.path.exists(qasm_file):
-        try:
-            with open(qasm_file, "rb") as f:
-                raw_bytes = f.read()
-            sha_norm = hashlib.sha256(raw_bytes.replace(b"\r\n", b"\n")).hexdigest()
-            sha_raw = hashlib.sha256(raw_bytes).hexdigest()
-            fname = os.path.basename(qasm_file).lower()
-            matched_peak = None
-            for kh, peak in KNOWN_PEAKS.items():
-                if sha_norm == kh or sha_raw == kh or kh[:8] in fname:
-                    matched_peak = peak
-                    break
-            if matched_peak:
-                log(f"[FAST TEST MODE] Certified milestone circuit match ({fname}): Peak={matched_peak}")
-                return matched_peak, {
-                    "method": "fast_test_mode",
-                    "n_qubits": len(matched_peak),
-                    "sha256": sha_norm,
-                    "trusted": True,
-                    "exact": True,
-                }
-        except Exception as e:
-            log(f"Fast test mode warning: {e}")
-
-    # Full Authentic Quantum Circuit Contraction Execution
     circ = _load_circuit(qasm_file)
     nq = circ.num_qubits
     log(f"Circuit loaded: {nq} qubits, {circ.size()} gates")
@@ -758,7 +692,9 @@ def solve(qasm_file):
                       "exact": True, "trusted": True}
     if ENGINE == "unswap":
         return _solve_unswap(circ)
-    return _solve_tebd_v4(circ)
+    if ENGINE == "tebd_v4":
+        return _solve_tebd_v4(circ)
+    raise ValueError(f"Unsupported HQP_ENGINE: {ENGINE!r}")
 
 
 def main():

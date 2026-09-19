@@ -416,7 +416,7 @@ def mpo_compress_unswap(circuit: QuantumCircuit, max_bond=8192, cutoff=0.001, un
 
 def mpo_to_mps(mpo_core, layers_left, layers_right, max_bond=4096, cutoff=0.001, to_backend=None):
     q2c = lambda qc: quimb_circuit(qc.decompose("unitary"), Circuit, to_backend=to_backend)
-    cutoff_mode = os.environ.get("HQP_CUTOFF_MODE", "rel")
+    cutoff_mode = os.environ.get("HQP_CUTOFF_MODE", "abs")
     compress_opts = {"cutoff_mode": cutoff_mode} if cutoff_mode in ("abs", "rel", "sum2", "rsum2") else {}
 
     # Use the compressed MPO to get the MPS by applying it to |0> state

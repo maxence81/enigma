@@ -191,6 +191,10 @@ workbench/challenges/*/
 !workbench/challenges/mock_challenge/
 workbench/challenges/*/*
 !workbench/challenges/*/README.md
+!workbench/challenges/hardening_quantum_proof/hqp_v3_solution/
+workbench/challenges/hardening_quantum_proof/hqp_v3_solution/*
+!workbench/challenges/hardening_quantum_proof/hqp_v3_solution/README_V9.md
+!workbench/challenges/hardening_quantum_proof/hqp_v3_solution/build_submission.py
 !workbench/challenges/*/example_solution/
 !workbench/challenges/*/example_solution/**
 !workbench/challenges/*/sample_circuits/
